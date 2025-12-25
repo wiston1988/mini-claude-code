@@ -1,72 +1,296 @@
-# mini Kode Agent
+# Mini Claude Code
 
-This repository showcases a step-by-step recreation of a “mini Kode” workflow. With a few hundred lines of Python we rebuild the essential loops behind Anthropic’s engineering assistant and release them in two major stages:
+English | [中文](./README.md)
 
-- **v1 (baseline)** – demonstrates the core *model-as-agent* loop: the LLM is the only decision maker, the CLI just exposes tools for reading, editing, writing files, and running shell commands.
-- **v2 (todos)** – layers structured planning on top of v1 with a shared todo board and system reminders so the model stays disciplined during multi-step tasks.
+> Production-ready: [Kode - Open Source Agent CLI](https://github.com/shareAI-lab/Kode)
 
-Below is a detailed walkthrough of how each version operates and what changed between them.
+## Overview
 
----
+This repository is a **learning-focused** recreation of Claude Code's core mechanisms. Through three progressive versions (~900 lines of Python total), it demonstrates the key design patterns behind AI coding agents:
 
-## v1: Minimal “Model as Agent” Loop
+| Version | Lines | Core Theme | Learning Objective |
+|---------|-------|------------|-------------------|
+| v1 | ~400 | Model as Agent | Understand the tool loop |
+| v2 | +170 | Structured Planning | Master Todo tool & system reminders |
+| v3 | +120 | Subagent Mechanism | Learn Task tool & context isolation |
 
-The first version proves a simple principle: **code supplies tools, the model drives the work**. About 400 lines of Python cover the following pillars:
+## Quick Start
 
-### 1. System prompt guardrails
-- The `SYSTEM` string reminds the model that it lives inside the repository, must act through tools, and should summarize when finished.
-- This keeps multi-turn conversations action oriented instead of drifting into idle chat.
+```bash
+# Install dependencies
+pip install anthropic
 
-### 2. Unified tool dispatch
-- The CLI exposes four tools: `bash`, `read_file`, `write_file`, and `edit_text`.
-- When the model outputs a `tool_use` block, the dispatcher runs the corresponding helper and returns a `tool_result` block with truncated, colorized output.
-- Safety checks gate the tools (path validation, banned commands, output clamping) to prevent runaway actions.
+# Configure API (edit ANTHROPIC_API_KEY in the code)
+# Supports Anthropic API or compatible endpoints (e.g., Moonshot Kimi)
 
-### 3. Terminal experience
-- A background `Spinner` thread indicates model latency.
-- `pretty_tool_line` and `pretty_sub_line` format every tool call in a readable, ANSI-colored layout.
-- The full conversation is stored in `messages`, preserving context across tool invocations.
+# Run any version
+python v1_basic_agent.py
+python v2_todo_agent.py
+python v3_subagent.py
+```
 
-### 4. Main event loop
-- The CLI prints the current workspace, accepts user input, and appends it to history.
-- Each turn calls `client.messages.create`; if the model wants tools, the loop recursively executes them until plain text is returned.
-- Errors are caught by `log_error_debug` so the session doesn’t crash.
+## File Structure
 
-> **Key insight:** a stable tool shell plus a focused system prompt is enough to let the model behave like a real coding agent. UI polish is optional; tool access is everything.
-
----
-
-## v2: Structured Planning and System Reminders
-
-Version 2 answers a natural question: *how do we keep the model organized over longer tasks?* The upgrade introduces a todo board, a reminder mechanism, and English-only copy to keep the workflow predictable.
-
-### 1. Todo toolchain
-- **`TodoManager`** maintains up to 20 entries, guarantees at most one `in_progress` item, and validates IDs, statuses, and descriptions.
-- **`TodoWrite`** becomes a first-class tool. The model calls it to create/update/complete todos; the CLI immediately renders colored status lines plus summary stats.
-- **Status colors** use a consistent palette: grey for pending, blue for in progress, green with strikethrough for completed.
-
-### 2. System reminders
-- **Initial reminder:** before the first user message, a system block instructs the model to manage multi-step work through the todo board.
-- **10-turn reminder:** if ten consecutive turns pass without a todo update, another reminder block is injected to nudge the model back to structured planning.
-- **Auto reset:** every todo update resets the counter so reminders only trigger when discipline lapses.
-
-### 3. Interaction changes
-- On input, user text and any pending reminders are bundled into a single content list so the model sees consistent context.
-- On output, todo results are printed immediately and appended to history, giving the model a short-term memory of its own plan.
-- All messages, summaries, and errors are now in English to match the neutral CLI aesthetic.
-
-### 4. Benefits
-- **Structured guardrails:** the model has to plan before acting, reducing “winging it” behavior.
-- **Self-supervision:** the todo board is an external memory surface that keeps current priorities visible.
-- **Auditability:** the session transcript contains every todo change, which makes reviews and debugging easier.
-
-> **Looking for a production-ready toolkit?** Check out [Kode](https://github.com/shareAI-lab/Kode), the open-source Claude Code implementation we maintain. It adds Windows Bash support, WebSearch/WebFetch, Docker adapters, and IDE plugins on top of the ideas explored here.
+```
+mini-claude-code/
+├── v1_basic_agent.py      # Baseline: 4 core tools + main loop
+├── v2_todo_agent.py       # Todo version: +TodoManager + System Reminder
+├── v3_subagent.py         # Subagent version: +Task tool + Agent Registry
+├── articles/              # Tutorial articles (Chinese)
+│   ├── v1文章.md
+│   ├── v2文章.md
+│   └── v3文章.md
+└── demo/                  # AI-generated game demos
+```
 
 ---
 
-## Summary
+## V1: Minimal Model-as-Agent Implementation
 
-- **v1 philosophy:** prove the minimal model-as-agent loop—tools are thin wrappers, the LLM carries the project.
-- **v2 philosophy:** enforce explicit planning via todos and system reminders so the workflow stays organized and transparent.
+**File**: `v1_basic_agent.py` (~400 lines)
 
-Future iterations will experiment with sub-agent tasks, richer reminder matrices, and will keep backporting mature features from Kode into this learning-friendly codebase. Contributions and experiments are welcome!
+**Core Idea**: Code supplies tools; the model is the sole decision-maker.
+
+### 1.1 System Prompt
+
+```python
+SYSTEM = (
+    f"You are a coding agent operating INSIDE the user's repository at {WORKDIR}.\n"
+    "Follow this loop strictly: plan briefly -> use TOOLS to act -> report results.\n"
+    "Rules:\n"
+    "- Prefer taking actions with tools over long prose.\n"
+    "- Never invent file paths. Read directories first if unsure.\n"
+    "- After finishing, summarize what changed."
+)
+```
+
+This prompt establishes behavioral boundaries:
+- Explicit working directory prevents the model from hallucinating file paths
+- "Tools first" mandate prevents verbose explanations without action
+- Summary requirement ensures user can verify results
+
+### 1.2 Four Core Tools
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `bash` | Execute shell commands | command, timeout_ms |
+| `read_file` | Read text files | path, start_line, end_line |
+| `write_file` | Create/overwrite files | path, content, mode |
+| `edit_text` | Precise text edits | path, action(replace/insert/delete_range) |
+
+Each tool includes safety checks:
+- **Path sandboxing**: `safe_path()` ensures all operations stay within workspace
+- **Command filtering**: Blocks `rm -rf /`, `sudo`, and other dangerous commands
+- **Output clamping**: Truncates results exceeding 100KB
+
+### 1.3 Main Loop Logic
+
+```python
+def query(messages):
+    while True:
+        response = client.messages.create(model, system, messages, tools)
+
+        # Process text output
+        for block in response.content:
+            if block.type == "text":
+                print(block.text)
+            if block.type == "tool_use":
+                tool_uses.append(block)
+
+        # If model requests tools, execute and continue
+        if response.stop_reason == "tool_use":
+            results = [dispatch_tool(tu) for tu in tool_uses]
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": results})
+            continue
+
+        # Otherwise return final result
+        return messages
+```
+
+This loop is the agent's heart: the model keeps calling tools until the task completes with plain text.
+
+---
+
+## V2: Structured Planning and System Reminders
+
+**File**: `v2_todo_agent.py` (~570 lines, +170 new)
+
+**Core Idea**: Use the Todo tool to keep the model anchored in a structured workflow.
+
+### 2.1 TodoManager Class
+
+```python
+class TodoManager:
+    def __init__(self):
+        self.items = []  # Max 20 items
+
+    def update(self, items):
+        # Validation rules:
+        # - Each item must have content, status, activeForm
+        # - Status must be pending/in_progress/completed
+        # - Only one item can be in_progress at a time
+        # - IDs must be unique
+```
+
+These constraints force the model to follow conventions instead of arbitrary output.
+
+### 2.2 TodoWrite Tool
+
+```python
+{
+    "name": "TodoWrite",
+    "input_schema": {
+        "items": [{
+            "content": "Task description",
+            "status": "pending | in_progress | completed",
+            "activeForm": "Present tense (e.g., Reading files)"
+        }]
+    }
+}
+```
+
+The model calls this tool to create and update task lists. The CLI renders colored status:
+- `pending` → Gray `[ ]`
+- `in_progress` → Blue `[ ]`
+- `completed` → Green `[x]` (with strikethrough)
+
+### 2.3 System Reminder Mechanism
+
+```python
+INITIAL_REMINDER = '<reminder>Use Todo tool for multi-step tasks</reminder>'
+NAG_REMINDER = '<reminder>10+ turns without Todo update, please resume planning</reminder>'
+
+# In main loop:
+if rounds_without_todo > 10:
+    inject_reminder(NAG_REMINDER)
+```
+
+This mechanism ensures the model doesn't forget to use Todo during long conversations.
+
+---
+
+## V3: Subagent Mechanism
+
+**File**: `v3_subagent.py` (~900 lines, +120 new)
+
+**Core Idea**: Divide and conquer + context isolation.
+
+### 3.1 Agent Type Registry
+
+```python
+AGENT_TYPES = {
+    "explore": {
+        "description": "Read-only agent for exploring codebases",
+        "tools": ["bash", "read_file"],  # Tool whitelist
+        "system_prompt": "You are an exploration agent, read-only..."
+    },
+    "code": {
+        "tools": "*",  # All tools
+        "system_prompt": "You are a coding agent, implement features..."
+    },
+    "plan": {
+        "tools": ["bash", "read_file"],
+        "system_prompt": "You are a planning agent, analyze and output plans..."
+    }
+}
+```
+
+Each agent type has its own tool permissions and system prompt.
+
+### 3.2 Task Tool Definition
+
+```python
+{
+    "name": "Task",
+    "input_schema": {
+        "description": "Short description (3-5 words)",
+        "prompt": "Detailed instructions",
+        "subagent_type": "explore | code | plan"
+    }
+}
+```
+
+The main agent dispatches subtasks by calling the Task tool.
+
+### 3.3 Subagent Execution Core (run_task)
+
+```python
+def run_task(inp, depth=0):
+    agent_type = inp["subagent_type"]
+    agent_config = AGENT_TYPES[agent_type]
+
+    # 1. Build agent-specific system prompt
+    sub_system = f"You are a {agent_type} subagent...\n{agent_config['system_prompt']}"
+
+    # 2. Filter available tools
+    sub_tools = get_tools_for_agent(agent_type)
+
+    # 3. Create isolated message history (KEY!)
+    sub_messages = [{"role": "user", "content": prompt}]
+
+    # 4. Recursively call the same query loop (silent mode)
+    result_messages = query(sub_messages, sub_system, sub_tools, silent=True)
+
+    # 5. Return only final text to parent agent
+    return extract_final_text(result_messages)
+```
+
+**Core Design Principles**:
+- **Message isolation**: Subagent cannot see parent conversation, and won't pollute it
+- **Tool filtering**: Explore agent can only read, not write
+- **Recursive reuse**: Subagent uses the same query() function
+- **Result abstraction**: Subagent may call 20 tools but returns only a summary
+
+### 3.4 Silent Mode and Progress Display
+
+```python
+class SubagentProgress:
+    def update(self, tool_name, tool_arg):
+        # Overwrite same line, don't pollute main chat
+        line = f"  | {tool_name}({tool_arg}) (+{count} tools, {elapsed}s)"
+        sys.stdout.write("\r" + line)
+```
+
+Subagent execution looks like:
+```
+@ Task(explore: Explore codebase)...
+  | Read(README.md) (+3 tool uses, 2.1s)   <- Real-time refresh
+  | completed: 8 tool calls in 15.2s       <- Final summary
+```
+
+---
+
+## Comparison with Claude Code / Kode
+
+| Feature | Claude Code / Kode | Mini Claude Code |
+|---------|-------------------|------------------|
+| Agent Registry | AgentConfig + YAML files | Python dict |
+| Task Parameters | +model, +resume, +run_in_background | Only 3 basic params |
+| Tool Filtering | Whitelist + Blacklist | Whitelist only |
+| Background Execution | Async + TaskOutput | Omitted (sync) |
+| Resume | Transcript storage/restore | Omitted |
+| forkContext | Can pass parent context | Omitted |
+
+Omitted features are advanced capabilities that don't affect understanding of core mechanisms.
+
+---
+
+## Tutorial Articles
+
+For detailed design rationale and code walkthrough, see the `articles/` directory:
+
+1. **v1文章.md**: No secrets in Claude Code! 400-line Model-as-Agent implementation
+2. **v2文章.md**: Todo tool for model self-discipline
+3. **v3文章.md**: Unveiling Subagent mechanism in 120 lines
+
+---
+
+## Related Resources
+
+- **Production Implementation**: [Kode - Open Source Agent CLI](https://github.com/shareAI-lab/Kode)
+- **X/Twitter**: [@baicai003](https://x.com/baicai003)
+
+## License
+
+MIT
